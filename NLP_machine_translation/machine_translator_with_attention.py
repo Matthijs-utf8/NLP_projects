@@ -6,9 +6,19 @@ from NLP_machine_translation.save_and_load_data_class import *
 from NLP_machine_translation.preprocess_data import Data
 import matplotlib.pyplot as plt
 import keras
-from keras.layers import Input, LSTM, Dense, Embedding
+from keras.layers import Input, LSTM, GRU, Dense, Embedding, \
+  Bidirectional, RepeatVector, Concatenate, Activation, Dot, Lambda
 from keras.models import Model
 import keras.backend as K
+
+# make sure we do softmax over the time axis
+# expected shape is N x T x D
+# note: the latest version of Keras allows you to pass in axis arg
+def softmax_over_time(x):
+  assert(K.ndim(x) > 2)
+  e = K.exp(x - K.max(x, axis=1, keepdims=True))
+  s = K.sum(e, axis=1, keepdims=True)
+  return e / s
 
 if __name__ == "__main__":
 
@@ -32,11 +42,44 @@ if __name__ == "__main__":
                                   output_dim=data.embedding_dim, # For each word we output a feature vector
                                   weights=[data.embedding_matrix], # Add the pre-trained weights
                                   trainable=False) # Don't train on pre-trained weights
-    encoder_lstm = LSTM(units=LATENT_DIM, # LSTM consists of LATENT_DIM units in a row
-                        return_state=True) # Returns not only the last output, but also the last hidden- and cell state
+    encoder_lstm = Bidirectional(LSTM(units=LATENT_DIM, # LSTM consists of LATENT_DIM units in a row
+                                      return_state=True)) # Returns not only the last output, but also the last hidden- and cell state
+
+    ### ATTENTION ###
+    # Attention layers need to be global because they will be repeated Ty times at the decoder
+    attn_repeat_layer = RepeatVector(data.max_sequence_length_inputs)
+    attn_concat_layer = Concatenate(axis=-1)  #
+    attn_dense1 = Dense(10, activation='tanh')
+    attn_dense2 = Dense(1, activation=keras.activations.softmax(axis=1))
+    attn_dot = Dot(axes=1)  # to perform the weighted sum of alpha[t] * h[t]
+
+    def one_step_attention(h, st_1):
+        # h = h(1), ..., h(Tx), shape = (Tx, LATENT_DIM * 2) --> encoder hidden states
+        # st_1 = s(t-1), shape = (LATENT_DIM_DECODER,) --> last output
+
+        # Copy s(t-1) Tx times now shape = (Tx, LATENT_DIM_DECODER)
+        st_1 = attn_repeat_layer(st_1)
+
+        # Concatenate all h(t)'s with s(t-1)
+        # Now of shape (Tx, LATENT_DIM_DECODER + LATENT_DIM * 2)
+        x = attn_concat_layer([h, st_1])
+
+        # Neural net first layer
+        x = attn_dense1(x)
+
+        # Neural net second layer with special softmax over time
+        alphas = attn_dense2(x)
+
+        # "Dot" the alphas and the h's
+        # Remember a.dot(b) = sum over a[t] * b[t]
+        context = attn_dot([alphas, h])
+
+        return context
 
     ### DECODER LAYERS ###
-    decoder_input = Input(shape=(data.decoder_inputs.shape[1],))
+    initial_s = Input(shape=(LATENT_DIM,), name='s0')  # The initial hidden state needs to be inputted
+    initial_c = Input(shape=(LATENT_DIM,), name='c0')  # The initial cell state needs to be inputted
+    decoder_input = Input(shape=(data.decoder_inputs.shape[1],)) # Input the correct word with teacher forcing
     decoder_embedding = Embedding(input_dim=data.num_words_outputs, # The input dimension is the same as the size of the dictionary
                                   output_dim=data.embedding_dim) # For each word we output a feature vector
     decoder_lstm = LSTM(units=LATENT_DIM, # LSTM consists of LATENT_DIM units in a row
@@ -44,17 +87,61 @@ if __name__ == "__main__":
                         return_sequences=True) # Since the decoder is a "to-many" model: return_sequences=True
     decoder_dense = Dense(units=data.num_words_outputs, # Return a prediction value for each word in the output dictionary
                           activation='softmax')  # Use softmax, as we are working with one-hot encoded words
+    context_last_word_concat_layer = Concatenate(axis=2) # Concatenate the last word with ne new context
 
     ### MODEL PIPELINE ###
     x = encoder_embedding(encoder_input)  # Pass the input through embedding layer
     encoder_output, hidden_state_encoder_output, cell_state_encoder_output = encoder_lstm(x)  # Get the encoder output and states
-    x = decoder_embedding(decoder_input) # Tell the decoder what the word should have been through teacher-forcing
-    decoder_outputs, _, _ = decoder_lstm(x, initial_state=[hidden_state_encoder_output, cell_state_encoder_output]) # The decoder starts with the last hidden- and cell state from decoder.
-    decoder_outputs = decoder_dense(decoder_outputs)
+    deconder_embedding_output = decoder_embedding(decoder_input) # Tell the decoder what the word should have been through teacher-forcing
+
+    # Unlike previous seq2seq, we cannot get the output all in one step
+    # Instead we need to do Ty steps
+    # In each of those steps, we need to consider all Tx h's
+
+    # s, c will be re-assigned in each iteration of the loop
+    s = initial_s
+    c = initial_c
+    outputs = [] #  Collect outputs in a list
+
+    for t in range(data.max_len_target):  # Ty times
+
+        # Get the context using attention
+        context = one_step_attention(encoder_output, s)
+
+        # We need a different layer for each time step
+        selector = Lambda(lambda x: x[:, t:t + 1])
+        xt = selector(deconder_embedding_output)
+
+        # Combine
+        decoder_lstm_input = context_last_word_concat_layer([context, xt])
+
+        # Pass the combined [context, last word] into the LSTM along with [s, c]
+        o, s, c = decoder_lstm(decoder_lstm_input, initial_state=[s, c]) # Get the new [s, c] and output
+
+        # Final dense layer to get next word prediction
+        decoder_output = decoder_dense(o)
+        outputs.append(decoder_output)
+
+
+    # 'outputs' is now a list of length Ty
+    # each element is of shape (batch size, output vocab size)
+    # therefore if we simply stack all the outputs into 1 tensor
+    # it would be of shape T x N x D
+    # we would like it to be of shape N x T x D
+
+    def stack_and_transpose(x):
+        # x is a list of length T, each element is a batch_size x output_vocab_size tensor
+        x = K.stack(x)  # is now T x batch_size x output_vocab_size tensor
+        x = K.permute_dimensions(x, pattern=(1, 0, 2))  # is now batch_size x T x output_vocab_size
+        return x
+
+    # Make it a layer
+    stacker = Lambda(stack_and_transpose)
+    outputs = stacker(outputs)
 
     ### CREATE MODEL ###
-    model = Model([encoder_input, decoder_input], # Inputs
-                  decoder_outputs) # Outputs
+    model = Model(inputs=[encoder_input, decoder_input, initial_s, initial_c], outputs=outputs)
+
     model.compile(optimizer="adam",
                   loss="categorical-crossentropy", # Use categorical cross-entropy for one-hot encoded outputs
                   metrics=["accuracy"])
